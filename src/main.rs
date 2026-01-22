@@ -1,4 +1,5 @@
 use actix_web::{web, App, HttpServer, HttpResponse, middleware};
+use actix_cors::Cors;
 use mongodb::{Client, bson::doc};
 use mongodb::options::ClientOptions;
 use serde::{Deserialize, Serialize};
@@ -151,6 +152,7 @@ async fn main() -> std::io::Result<()> {
     HttpServer::new(move || {
         App::new()
             .app_data(db.clone())
+            .wrap(Cors::permissive())
             .wrap(middleware::NormalizePath::trim())
             .route("/api/signup", web::post().to(signup))
             .route("/api/login", web::post().to(login))
