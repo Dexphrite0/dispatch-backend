@@ -65,10 +65,17 @@ async fn signup(
                 user_id,
             })
         }
-        Err(_) => {
-            HttpResponse::BadRequest().json(ErrorResponse {
-                error: "Email already exists".to_string(),
-            })
+        Err(e) => {
+            // Check if error is duplicate key (email already exists)
+            if e.to_string().contains("duplicate key") || e.to_string().contains("E11000") {
+                HttpResponse::BadRequest().json(ErrorResponse {
+                    error: "Email already exists".to_string(),
+                })
+            } else {
+                HttpResponse::BadRequest().json(ErrorResponse {
+                    error: "Failed to create user".to_string(),
+                })
+            }
         }
     }
 }
@@ -145,6 +152,21 @@ async fn main() -> std::io::Result<()> {
         .expect("Failed to create MongoDB client");
     
     let db = client.database("my_app");
+    let users = db.collection::<User>("users");
+    
+    // Create unique index on email - prevents duplicate emails at database level
+    users.create_index(
+        mongodb::IndexModel::builder()
+            .keys(doc! { "email": 1 })
+            .options(mongodb::options::IndexOptions::builder().unique(true).build())
+            .build(),
+        None,
+    )
+    .await
+    .ok();
+    
+    println!("✓ Email unique index created/verified");
+    
     let db = web::Data::new(db);
 
     println!("Starting server on http://0.0.0.0:8000");
