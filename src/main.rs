@@ -1,8 +1,9 @@
-use actix_web::{web, App, HttpServer, HttpResponse, middleware};
+use actix_web::{web, App, HttpServer, HttpResponse, middleware, get, post};
 use actix_cors::Cors;
 use mongodb::{Client, bson::{doc, oid::ObjectId}};
 use mongodb::options::ClientOptions;
 use serde::{Deserialize, Serialize};
+use serde_json::json;
 
 #[derive(Serialize, Deserialize, Clone)]
 struct User {
@@ -13,6 +14,18 @@ struct User {
     email: String,
     password: String,
     role: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    profilePic: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    backgroundImage: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    phone: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    location: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    website: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    bio: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -87,6 +100,12 @@ async fn signup(
         email: req.email.clone(),
         password: hashed,
         role: None,
+        profilePic: None,
+        backgroundImage: None,
+        phone: None,
+        location: None,
+        website: None,
+        bio: None,
     };
 
     // FOURTH: Insert user
@@ -190,7 +209,7 @@ async fn set_role(
         Ok(result) => {
             if result.modified_count > 0 {
                 println!("Role set successfully for user: {} to {}", req.user_id, req.role);
-                HttpResponse::Ok().json(serde_json::json!({
+                HttpResponse::Ok().json(json!({
                     "message": format!("Role set to {}", req.role)
                 }))
             } else {
@@ -205,6 +224,170 @@ async fn set_role(
             HttpResponse::BadRequest().json(ErrorResponse {
                 error: "Failed to set role".to_string(),
             })
+        }
+    }
+}
+
+// GET user profile data
+#[get("/api/user/{user_id}")]
+async fn get_user(
+    user_id: web::Path<String>,
+    db: web::Data<mongodb::Database>,
+) -> HttpResponse {
+    let users = db.collection::<User>("users");
+    let user_id_str = user_id.into_inner();
+    
+    let user_oid = match ObjectId::parse_str(&user_id_str) {
+        Ok(oid) => oid,
+        Err(_) => return HttpResponse::BadRequest().json(json!({"error": "Invalid user ID"})),
+    };
+
+    match users.find_one(doc! { "_id": user_oid }, None).await {
+        Ok(Some(user)) => HttpResponse::Ok().json(user),
+        Ok(None) => HttpResponse::NotFound().json(json!({"error": "User not found"})),
+        Err(e) => {
+            eprintln!("Database error: {}", e);
+            HttpResponse::InternalServerError().json(json!({"error": "Database error"}))
+        }
+    }
+}
+
+// POST profile pic to user
+#[derive(Deserialize)]
+struct ProfilePicRequest {
+    profilePic: String,
+}
+
+#[post("/api/user/{user_id}/profile-pic")]
+async fn save_profile_pic(
+    user_id: web::Path<String>,
+    body: web::Json<ProfilePicRequest>,
+    db: web::Data<mongodb::Database>,
+) -> HttpResponse {
+    let users = db.collection::<User>("users");
+    let user_id_str = user_id.into_inner();
+    
+    let user_oid = match ObjectId::parse_str(&user_id_str) {
+        Ok(oid) => oid,
+        Err(_) => return HttpResponse::BadRequest().json(json!({"error": "Invalid user ID"})),
+    };
+
+    match users.update_one(
+        doc! { "_id": user_oid },
+        doc! { "$set": { "profilePic": &body.profilePic } },
+        None,
+    ).await {
+        Ok(_) => {
+            println!("Profile pic saved for user: {}", user_id_str);
+            HttpResponse::Ok().json(json!({"message": "Profile pic saved"}))
+        }
+        Err(e) => {
+            eprintln!("Database error: {}", e);
+            HttpResponse::InternalServerError().json(json!({"error": "Failed to save profile pic"}))
+        }
+    }
+}
+
+// POST background image to user
+#[derive(Deserialize)]
+struct BackgroundRequest {
+    backgroundImage: String,
+}
+
+#[post("/api/user/{user_id}/background")]
+async fn save_background(
+    user_id: web::Path<String>,
+    body: web::Json<BackgroundRequest>,
+    db: web::Data<mongodb::Database>,
+) -> HttpResponse {
+    let users = db.collection::<User>("users");
+    let user_id_str = user_id.into_inner();
+    
+    let user_oid = match ObjectId::parse_str(&user_id_str) {
+        Ok(oid) => oid,
+        Err(_) => return HttpResponse::BadRequest().json(json!({"error": "Invalid user ID"})),
+    };
+
+    match users.update_one(
+        doc! { "_id": user_oid },
+        doc! { "$set": { "backgroundImage": &body.backgroundImage } },
+        None,
+    ).await {
+        Ok(_) => {
+            println!("Background image saved for user: {}", user_id_str);
+            HttpResponse::Ok().json(json!({"message": "Background image saved"}))
+        }
+        Err(e) => {
+            eprintln!("Database error: {}", e);
+            HttpResponse::InternalServerError().json(json!({"error": "Failed to save background"}))
+        }
+    }
+}
+
+// POST profile update (bio, phone, location, website, etc)
+#[derive(Deserialize)]
+struct ProfileUpdateRequest {
+    firstName: Option<String>,
+    lastName: Option<String>,
+    bio: Option<String>,
+    phone: Option<String>,
+    location: Option<String>,
+    website: Option<String>,
+    role: Option<String>,
+}
+
+#[post("/api/user/{user_id}/profile")]
+async fn update_profile(
+    user_id: web::Path<String>,
+    body: web::Json<ProfileUpdateRequest>,
+    db: web::Data<mongodb::Database>,
+) -> HttpResponse {
+    let users = db.collection::<User>("users");
+    let user_id_str = user_id.into_inner();
+    
+    let user_oid = match ObjectId::parse_str(&user_id_str) {
+        Ok(oid) => oid,
+        Err(_) => return HttpResponse::BadRequest().json(json!({"error": "Invalid user ID"})),
+    };
+
+    let mut update_fields = doc! {};
+    
+    if let Some(ref first_name) = body.firstName {
+        update_fields.insert("firstName", first_name);
+    }
+    if let Some(ref last_name) = body.lastName {
+        update_fields.insert("lastName", last_name);
+    }
+    if let Some(ref bio) = body.bio {
+        update_fields.insert("bio", bio);
+    }
+    if let Some(ref phone) = body.phone {
+        update_fields.insert("phone", phone);
+    }
+    if let Some(ref location) = body.location {
+        update_fields.insert("location", location);
+    }
+    if let Some(ref website) = body.website {
+        update_fields.insert("website", website);
+    }
+    if let Some(ref role) = body.role {
+        update_fields.insert("role", role);
+    }
+
+    let update_doc = doc! { "$set": update_fields };
+
+    match users.update_one(
+        doc! { "_id": user_oid },
+        update_doc,
+        None,
+    ).await {
+        Ok(_) => {
+            println!("Profile updated for user: {}", user_id_str);
+            HttpResponse::Ok().json(json!({"message": "Profile updated"}))
+        }
+        Err(e) => {
+            eprintln!("Database error: {}", e);
+            HttpResponse::InternalServerError().json(json!({"error": "Failed to update profile"}))
         }
     }
 }
@@ -225,8 +408,7 @@ async fn main() -> std::io::Result<()> {
     
     let db = client.database("my_app");
     let users = db.collection::<User>("users");
-    
-    // Create unique index on email - prevents duplicate emails at database level
+
     match users.create_index(
         mongodb::IndexModel::builder()
             .keys(doc! { "email": 1 })
@@ -259,6 +441,10 @@ async fn main() -> std::io::Result<()> {
             .route("/api/signup", web::post().to(signup))
             .route("/api/login", web::post().to(login))
             .route("/api/set-role", web::post().to(set_role))
+            .service(get_user)
+            .service(save_profile_pic)
+            .service(save_background)
+            .service(update_profile)
     })
     .bind("0.0.0.0:8000")?
     .run()
