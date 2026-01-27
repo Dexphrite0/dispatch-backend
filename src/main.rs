@@ -172,9 +172,17 @@ async fn main() -> std::io::Result<()> {
     println!("Starting server on http://0.0.0.0:8000");
 
     HttpServer::new(move || {
+        // Proper CORS configuration
+        let cors = Cors::default()
+            .allow_any_origin()
+            .allow_any_method()
+            .allow_any_header()
+            .supports_credentials()
+            .max_age(3600);
+
         App::new()
             .app_data(db.clone())
-            .wrap(Cors::permissive())
+            .wrap(cors)
             .wrap(middleware::NormalizePath::trim())
             .route("/api/signup", web::post().to(signup))
             .route("/api/login", web::post().to(login))
