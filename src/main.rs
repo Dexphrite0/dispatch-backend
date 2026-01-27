@@ -46,8 +46,30 @@ async fn signup(
 ) -> HttpResponse {
     let users = db.collection::<User>("users");
     
+    // FIRST: Check if email already exists
+    match users.find_one(doc! { "email": &req.email }, None).await {
+        Ok(Some(_)) => {
+            // Email already exists - STOP here and return error
+            return HttpResponse::BadRequest().json(ErrorResponse {
+                error: "Email already exists".to_string(),
+            });
+        }
+        Err(e) => {
+            // Database error during check
+            println!("Database error checking email: {}", e);
+            return HttpResponse::InternalServerError().json(ErrorResponse {
+                error: "Database error".to_string(),
+            });
+        }
+        Ok(None) => {
+            // Email is unique, continue with signup
+        }
+    }
+    
+    // SECOND: Hash password
     let hashed = bcrypt::hash(&req.password, 4).unwrap_or_else(|_| req.password.clone());
     
+    // THIRD: Create user object
     let user = User {
         id: None,
         firstName: req.firstName.clone(),
@@ -57,25 +79,21 @@ async fn signup(
         role: None,
     };
 
+    // FOURTH: Insert user
     match users.insert_one(&user, None).await {
         Ok(result) => {
             let user_id = result.inserted_id.to_string();
+            println!("User created successfully: {}", req.email);
             HttpResponse::Ok().json(AuthResponse {
                 message: "User created".to_string(),
                 user_id,
             })
         }
         Err(e) => {
-            // Check if error is duplicate key (email already exists)
-            if e.to_string().contains("duplicate key") || e.to_string().contains("E11000") {
-                HttpResponse::BadRequest().json(ErrorResponse {
-                    error: "Email already exists".to_string(),
-                })
-            } else {
-                HttpResponse::BadRequest().json(ErrorResponse {
-                    error: "Failed to create user".to_string(),
-                })
-            }
+            println!("Error inserting user: {}", e);
+            HttpResponse::BadRequest().json(ErrorResponse {
+                error: "Failed to create user".to_string(),
+            })
         }
     }
 }
@@ -89,19 +107,28 @@ async fn login(
     match users.find_one(doc! { "email": &req.email }, None).await {
         Ok(Some(user)) => {
             if bcrypt::verify(&req.password, &user.password).unwrap_or(false) {
+                println!("Login successful for: {}", req.email);
                 HttpResponse::Ok().json(AuthResponse {
                     message: "Login successful".to_string(),
                     user_id: user.id.unwrap_or_default(),
                 })
             } else {
+                println!("Invalid password for: {}", req.email);
                 HttpResponse::Unauthorized().json(ErrorResponse {
                     error: "Invalid password".to_string(),
                 })
             }
         }
-        _ => {
+        Ok(None) => {
+            println!("User not found: {}", req.email);
             HttpResponse::Unauthorized().json(ErrorResponse {
                 error: "User not found".to_string(),
+            })
+        }
+        Err(e) => {
+            println!("Database error during login: {}", e);
+            HttpResponse::InternalServerError().json(ErrorResponse {
+                error: "Database error".to_string(),
             })
         }
     }
@@ -124,12 +151,21 @@ async fn set_role(
         doc! { "$set": { "role": &req.role } },
         None
     ).await {
-        Ok(_) => {
-            HttpResponse::Ok().json(serde_json::json!({
-                "message": format!("Role set to {}", req.role)
-            }))
+        Ok(result) => {
+            if result.modified_count > 0 {
+                println!("Role set successfully for user: {}", req.user_id);
+                HttpResponse::Ok().json(serde_json::json!({
+                    "message": format!("Role set to {}", req.role)
+                }))
+            } else {
+                println!("User not found for role update: {}", req.user_id);
+                HttpResponse::BadRequest().json(ErrorResponse {
+                    error: "User not found".to_string(),
+                })
+            }
         }
-        Err(_) => {
+        Err(e) => {
+            println!("Error setting role: {}", e);
             HttpResponse::BadRequest().json(ErrorResponse {
                 error: "Failed to set role".to_string(),
             })
@@ -155,17 +191,17 @@ async fn main() -> std::io::Result<()> {
     let users = db.collection::<User>("users");
     
     // Create unique index on email - prevents duplicate emails at database level
-    users.create_index(
+    match users.create_index(
         mongodb::IndexModel::builder()
             .keys(doc! { "email": 1 })
             .options(mongodb::options::IndexOptions::builder().unique(true).build())
             .build(),
         None,
     )
-    .await
-    .ok();
-    
-    println!("✓ Email unique index created/verified");
+    .await {
+        Ok(_) => println!("✓ Email unique index created/verified"),
+        Err(e) => println!("Warning: Could not create index: {}", e),
+    }
     
     let db = web::Data::new(db);
 
