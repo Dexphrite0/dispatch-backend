@@ -36,6 +36,16 @@ struct AuthResponse {
 }
 
 #[derive(Serialize)]
+struct LoginResponse {
+    message: String,
+    user_id: String,
+    firstName: String,
+    lastName: String,
+    email: String,
+    role: Option<String>,
+}
+
+#[derive(Serialize)]
 struct ErrorResponse {
     error: String,
 }
@@ -117,9 +127,15 @@ async fn login(
                     .unwrap_or_else(|| "unknown".to_string());
                 
                 println!("Login successful for: {}", req.email);
-                HttpResponse::Ok().json(AuthResponse {
+                println!("User role: {:?}", user.role);
+                
+                HttpResponse::Ok().json(LoginResponse {
                     message: "Login successful".to_string(),
                     user_id,
+                    firstName: user.firstName,
+                    lastName: user.lastName,
+                    email: user.email,
+                    role: user.role,
                 })
             } else {
                 println!("Invalid password for: {}", req.email);
@@ -173,7 +189,7 @@ async fn set_role(
     ).await {
         Ok(result) => {
             if result.modified_count > 0 {
-                println!("Role set successfully for user: {}", req.user_id);
+                println!("Role set successfully for user: {} to {}", req.user_id, req.role);
                 HttpResponse::Ok().json(serde_json::json!({
                     "message": format!("Role set to {}", req.role)
                 }))
