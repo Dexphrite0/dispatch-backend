@@ -1,13 +1,13 @@
 use actix_web::{web, App, HttpServer, HttpResponse, middleware};
 use actix_cors::Cors;
-use mongodb::{Client, bson::doc};
+use mongodb::{Client, bson::{doc, oid::ObjectId}};
 use mongodb::options::ClientOptions;
 use serde::{Deserialize, Serialize};
 
 #[derive(Serialize, Deserialize, Clone)]
 struct User {
     #[serde(rename = "_id", skip_serializing_if = "Option::is_none")]
-    id: Option<String>,
+    id: Option<ObjectId>,
     firstName: String,
     lastName: String,
     email: String,
@@ -82,8 +82,13 @@ async fn signup(
     // FOURTH: Insert user
     match users.insert_one(&user, None).await {
         Ok(result) => {
-            let user_id = result.inserted_id.to_string();
-            println!("User created successfully: {}", req.email);
+            // Get the inserted ID and convert to string
+            let user_id = result.inserted_id.as_object_id()
+                .map(|oid| oid.to_hex())
+                .unwrap_or_else(|| "unknown".to_string());
+            
+            println!("User created successfully: {} with ID: {}", req.email, user_id);
+            
             HttpResponse::Ok().json(AuthResponse {
                 message: "User created".to_string(),
                 user_id,
@@ -107,10 +112,14 @@ async fn login(
     match users.find_one(doc! { "email": &req.email }, None).await {
         Ok(Some(user)) => {
             if bcrypt::verify(&req.password, &user.password).unwrap_or(false) {
+                let user_id = user.id
+                    .map(|oid| oid.to_hex())
+                    .unwrap_or_else(|| "unknown".to_string());
+                
                 println!("Login successful for: {}", req.email);
                 HttpResponse::Ok().json(AuthResponse {
                     message: "Login successful".to_string(),
-                    user_id: user.id.unwrap_or_default(),
+                    user_id,
                 })
             } else {
                 println!("Invalid password for: {}", req.email);
@@ -146,8 +155,19 @@ async fn set_role(
 ) -> HttpResponse {
     let users = db.collection::<User>("users");
 
+    // Convert the user_id string back to ObjectId
+    let user_oid = match ObjectId::parse_str(&req.user_id) {
+        Ok(oid) => oid,
+        Err(e) => {
+            println!("Invalid user_id format: {} - Error: {}", req.user_id, e);
+            return HttpResponse::BadRequest().json(ErrorResponse {
+                error: "Invalid user ID format".to_string(),
+            });
+        }
+    };
+
     match users.update_one(
-        doc! { "_id": &req.user_id },
+        doc! { "_id": user_oid },
         doc! { "$set": { "role": &req.role } },
         None
     ).await {
