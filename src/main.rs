@@ -131,6 +131,11 @@ struct ProfileUpdateRequest {
     role: Option<String>,
 }
 
+#[derive(Deserialize)]
+struct ViewedEmailRequest {
+    emailId: String,
+}
+
 // Helper function to format Unix timestamp to readable string
 fn format_timestamp(timestamp: i64) -> String {
     match ChronoDateTime::<Utc>::from_timestamp_millis(timestamp) {
@@ -631,6 +636,81 @@ async fn delete_message(
     }
 }
 
+// VIEWED EMAILS ENDPOINTS
+
+#[get("/api/user/{user_id}/viewed-emails")]
+async fn get_viewed_emails(
+    user_id: web::Path<String>,
+    db: web::Data<mongodb::Database>,
+) -> HttpResponse {
+    let viewed_collection = db.collection::<serde_json::Value>("viewed_emails");
+    let user_id_str = user_id.into_inner();
+
+    match viewed_collection.find_one(doc! { "user_id": &user_id_str }, None).await {
+        Ok(Some(doc)) => {
+            if let Some(emails) = doc.get("emailIds").and_then(|v| v.as_array()) {
+                let email_ids: Vec<String> = emails
+                    .iter()
+                    .filter_map(|id| id.as_str().map(|s| s.to_string()))
+                    .collect();
+                
+                HttpResponse::Ok().json(json!({"viewedEmails": email_ids}))
+            } else {
+                HttpResponse::Ok().json(json!({"viewedEmails": []}))
+            }
+        }
+        Ok(None) => HttpResponse::Ok().json(json!({"viewedEmails": []})),
+        Err(e) => {
+            eprintln!("Error fetching viewed emails: {}", e);
+            HttpResponse::InternalServerError().json(json!({"error": "Failed to fetch viewed emails"}))
+        }
+    }
+}
+
+#[post("/api/user/{user_id}/viewed-emails")]
+async fn mark_email_viewed(
+    user_id: web::Path<String>,
+    body: web::Json<ViewedEmailRequest>,
+    db: web::Data<mongodb::Database>,
+) -> HttpResponse {
+    let viewed_collection = db.collection::<serde_json::Value>("viewed_emails");
+    let user_id_str = user_id.into_inner();
+
+    match viewed_collection
+        .update_one(
+            doc! { "user_id": &user_id_str },
+            doc! {
+                "$addToSet": { "emailIds": &body.emailId }
+            },
+            None,
+        )
+        .await
+    {
+        Ok(result) => {
+            // If no document was updated (user doesn't exist yet), insert one
+            if result.modified_count == 0 {
+                let _ = viewed_collection
+                    .insert_one(
+                        serde_json::json!({
+                            "user_id": &user_id_str,
+                            "emailIds": vec![&body.emailId]
+                        }),
+                        None,
+                    )
+                    .await;
+            }
+
+            println!("Email {} marked as viewed for user: {}", body.emailId, user_id_str);
+            HttpResponse::Ok().json(json!({"message": "Email marked as viewed"}))
+        }
+        Err(e) => {
+            eprintln!("Error marking email as viewed: {}", e);
+            HttpResponse::InternalServerError()
+                .json(json!({"error": "Failed to mark email as viewed"}))
+        }
+    }
+}
+
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
     dotenv::dotenv().ok();
@@ -688,6 +768,9 @@ async fn main() -> std::io::Result<()> {
             .service(get_messages)
             .service(update_message)
             .service(delete_message)
+            // Viewed emails endpoints
+            .service(get_viewed_emails)
+            .service(mark_email_viewed)
     })
     .bind("0.0.0.0:8000")?
     .run()
