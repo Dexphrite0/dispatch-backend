@@ -529,6 +529,37 @@ async fn update_profile(
 
 // MESSAGE ENDPOINTS
 
+// GET user messages from messages collection
+#[get("/api/user/{user_id}/messages")]
+async fn get_user_messages(
+    user_id: web::Path<String>,
+    db: web::Data<mongodb::Database>,
+) -> HttpResponse {
+    let messages_collection = db.collection::<serde_json::Value>("messages");
+    let user_id_str = user_id.into_inner();
+
+    println!("Fetching messages for user: {}", user_id_str);
+
+    match messages_collection
+        .find(doc! { "user_id": &user_id_str }, None)
+        .await
+    {
+        Ok(mut cursor) => {
+            let mut messages = Vec::new();
+            while let Ok(Some(msg)) = cursor.try_next().await {
+                messages.push(msg);
+            }
+            println!("Found {} messages for user: {}", messages.len(), user_id_str);
+            HttpResponse::Ok().json(messages)
+        }
+        Err(e) => {
+            eprintln!("Error fetching messages for user {}: {}", user_id_str, e);
+            HttpResponse::InternalServerError()
+                .json(json!({"error": "Failed to fetch messages"}))
+        }
+    }
+}
+
 #[post("/api/user/{user_id}/messages")]
 async fn save_messages(
     user_id: web::Path<String>,
@@ -720,11 +751,15 @@ async fn send_email_to_users(
     body: web::Json<SendEmailRequest>,
     db: web::Data<mongodb::Database>,
 ) -> HttpResponse {
-    let messages = db.collection::<serde_json::Value>("messages");
+    let messages_collection = db.collection::<serde_json::Value>("messages");
 
+    println!("=== SEND EMAIL START ===");
     println!("Sending email to {} users", body.userIds.len());
     println!("User IDs: {:?}", body.userIds);
+    println!("Subject: {}", body.subject);
 
+    let mut sent_count = 0;
+    
     for user_id in &body.userIds {
         let timestamp = Utc::now().timestamp_millis();
         let email_id = format!("admin-email-{}", timestamp);
@@ -745,18 +780,28 @@ async fn send_email_to_users(
             "isAdmin": true
         });
 
-        match messages.insert_one(email.clone(), None).await {
+        println!("Inserting email for user: {}", user_id);
+        println!("Email data: {:?}", email);
+
+        match messages_collection.insert_one(email, None).await {
             Ok(result) => {
-                println!("✓ Email sent to user {}: {:?}", user_id, result.inserted_id);
+                println!("✓ SUCCESS: Email inserted with ID: {:?}", result.inserted_id);
+                sent_count += 1;
             }
             Err(e) => {
-                eprintln!("✗ Failed to send email to user {}: {}", user_id, e);
+                eprintln!("✗ FAILED: Could not insert email for user {}: {}", user_id, e);
             }
         }
     }
 
-    println!("✓ Email broadcast completed");
-    HttpResponse::Ok().json(json!({"message": "Email sent successfully", "count": body.userIds.len()}))
+    println!("=== SEND EMAIL END ===");
+    println!("Successfully sent {} out of {} emails", sent_count, body.userIds.len());
+    
+    HttpResponse::Ok().json(json!({
+        "message": "Email sent successfully", 
+        "count": sent_count,
+        "requested": body.userIds.len()
+    }))
 }
 
 #[get("/api/user/{user_id}/viewed-emails")]
@@ -885,6 +930,7 @@ async fn main() -> std::io::Result<()> {
             .service(save_background)
             .service(update_profile)
             // Message endpoints
+            .service(get_user_messages)
             .service(save_messages)
             .service(get_messages)
             .service(update_message)
