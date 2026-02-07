@@ -4,6 +4,7 @@ use mongodb::{Client, bson::{doc, oid::ObjectId}};
 use mongodb::options::ClientOptions;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use chrono::{Utc, DateTime as ChronoDateTime};
 
 #[derive(Serialize, Deserialize, Clone)]
 struct User {
@@ -26,6 +27,8 @@ struct User {
     website: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     bio: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    createdAt: Option<i64>, // Store as Unix timestamp
 }
 
 #[derive(Deserialize)]
@@ -46,6 +49,11 @@ struct LoginRequest {
 struct AuthResponse {
     message: String,
     user_id: String,
+    firstName: String,
+    lastName: String,
+    email: String,
+    createdAt: String,
+    createdAtRelative: String,
 }
 
 #[derive(Serialize)]
@@ -56,11 +64,50 @@ struct LoginResponse {
     lastName: String,
     email: String,
     role: Option<String>,
+    createdAt: String,
+    createdAtRelative: String,
 }
 
 #[derive(Serialize)]
 struct ErrorResponse {
     error: String,
+}
+
+// Helper function to format Unix timestamp to readable string
+fn format_timestamp(timestamp: i64) -> String {
+    match ChronoDateTime::<Utc>::from_timestamp_millis(timestamp) {
+        Some(datetime) => datetime.format("%b %d, %Y, %H:%M %p").to_string(),
+        None => "Unknown".to_string(),
+    }
+}
+
+// Helper function to format timestamp as relative time (e.g., "4 hrs ago", "2 days ago")
+fn format_timestamp_relative(timestamp: i64) -> String {
+    let now = Utc::now().timestamp_millis();
+    let diff_ms = now - timestamp;
+    let diff_seconds = diff_ms / 1000;
+    
+    if diff_seconds < 60 {
+        "just now".to_string()
+    } else if diff_seconds < 3600 {
+        let mins = diff_seconds / 60;
+        format!("{} min{} ago", mins, if mins == 1 { "" } else { "s" })
+    } else if diff_seconds < 86400 {
+        let hours = diff_seconds / 3600;
+        format!("{} hr{} ago", hours, if hours == 1 { "" } else { "s" })
+    } else if diff_seconds < 604800 {
+        let days = diff_seconds / 86400;
+        format!("{} day{} ago", days, if days == 1 { "" } else { "s" })
+    } else if diff_seconds < 2592000 {
+        let weeks = diff_seconds / 604800;
+        format!("{} week{} ago", weeks, if weeks == 1 { "" } else { "s" })
+    } else if diff_seconds < 31536000 {
+        let months = diff_seconds / 2592000;
+        format!("{} month{} ago", months, if months == 1 { "" } else { "s" })
+    } else {
+        let years = diff_seconds / 31536000;
+        format!("{} year{} ago", years, if years == 1 { "" } else { "s" })
+    }
 }
 
 async fn signup(
@@ -92,7 +139,8 @@ async fn signup(
     // SECOND: Hash password
     let hashed = bcrypt::hash(&req.password, 4).unwrap_or_else(|_| req.password.clone());
     
-    // THIRD: Create user object
+    // THIRD: Create user object with createdAt timestamp
+    let now_timestamp = Utc::now().timestamp_millis();
     let user = User {
         id: None,
         firstName: req.firstName.clone(),
@@ -106,6 +154,7 @@ async fn signup(
         location: None,
         website: None,
         bio: None,
+        createdAt: Some(now_timestamp),
     };
 
     // FOURTH: Insert user
@@ -116,11 +165,20 @@ async fn signup(
                 .map(|oid| oid.to_hex())
                 .unwrap_or_else(|| "unknown".to_string());
             
+            // Format the timestamp for response
+            let created_at_str = format_timestamp(now_timestamp);
+            let created_at_relative = format_timestamp_relative(now_timestamp);
+            
             println!("User created successfully: {} with ID: {}", req.email, user_id);
             
             HttpResponse::Ok().json(AuthResponse {
                 message: "User created".to_string(),
                 user_id,
+                firstName: req.firstName.clone(),
+                lastName: req.lastName.clone(),
+                email: req.email.clone(),
+                createdAt: created_at_str,
+                createdAtRelative: created_at_relative,
             })
         }
         Err(e) => {
@@ -145,6 +203,15 @@ async fn login(
                     .map(|oid| oid.to_hex())
                     .unwrap_or_else(|| "unknown".to_string());
                 
+                // Format the timestamp for response
+                let created_at_str = user.createdAt
+                    .map(|ts| format_timestamp(ts))
+                    .unwrap_or_else(|| "Unknown".to_string());
+                
+                let created_at_relative = user.createdAt
+                    .map(|ts| format_timestamp_relative(ts))
+                    .unwrap_or_else(|| "Unknown".to_string());
+                
                 println!("Login successful for: {}", req.email);
                 println!("User role: {:?}", user.role);
                 
@@ -155,6 +222,8 @@ async fn login(
                     lastName: user.lastName,
                     email: user.email,
                     role: user.role,
+                    createdAt: created_at_str,
+                    createdAtRelative: created_at_relative,
                 })
             } else {
                 println!("Invalid password for: {}", req.email);
@@ -243,7 +312,32 @@ async fn get_user(
     };
 
     match users.find_one(doc! { "_id": user_oid }, None).await {
-        Ok(Some(user)) => HttpResponse::Ok().json(user),
+        Ok(Some(user)) => {
+            // Create response with formatted createdAt
+            let mut response_user = json!({
+                "_id": user.id.map(|oid| oid.to_hex()),
+                "firstName": user.firstName,
+                "lastName": user.lastName,
+                "email": user.email,
+                "role": user.role,
+                "profilePic": user.profilePic,
+                "backgroundImage": user.backgroundImage,
+                "phone": user.phone,
+                "location": user.location,
+                "website": user.website,
+                "bio": user.bio,
+            });
+            
+            // Convert createdAt timestamp to readable strings
+            if let Some(created_at_ts) = user.createdAt {
+                let created_at_str = format_timestamp(created_at_ts);
+                let created_at_relative = format_timestamp_relative(created_at_ts);
+                response_user["createdAt"] = json!(created_at_str);
+                response_user["createdAtRelative"] = json!(created_at_relative);
+            }
+            
+            HttpResponse::Ok().json(response_user)
+        },
         Ok(None) => HttpResponse::NotFound().json(json!({"error": "User not found"})),
         Err(e) => {
             eprintln!("Database error: {}", e);
