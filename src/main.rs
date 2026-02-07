@@ -224,7 +224,28 @@ async fn signup(
             let created_at_str = format_timestamp(now_timestamp);
             let created_at_relative = format_timestamp_relative(now_timestamp);
             
+            // Create welcome email for new user
+            let welcome_email = serde_json::json!({
+                "user_id": &user_id,
+                "id": "welcome-email",
+                "from": "Dispatch Team",
+                "subject": "Welcome to Dispatch! 🎉",
+                "preview": "Get started with your incident reporting dashboard",
+                "body": "Welcome to Dispatch! 🎉\n\nThank you for creating your account. We're excited to have you on board!\n\nHere's what you can do with Dispatch:\n• Create and track incident reports\n• Receive real-time status updates\n• Collaborate with admin and management teams\n• Access comprehensive analytics and insights\n\nGetting Started:\n1. Complete your profile - Add your details to help us serve you better\n2. Create your first report - Start documenting incidents immediately\n3. Explore integrations - Connect with Email, SMS, and Google Calendar\n\nNeed Help?\nOur support team is here to assist you. Check out our documentation or reach out to support@dispatch.com\n\nBest regards,\nThe Dispatch Team",
+                "timestamp": "just now",
+                "createdAtTimestamp": now_timestamp,
+                "unread": true,
+                "starred": false,
+                "role": "admin",
+                "isWelcome": true
+            });
+            
+            // Save welcome email to messages collection
+            let messages = db.collection::<serde_json::Value>("messages");
+            let _ = messages.insert_one(welcome_email, None).await;
+            
             println!("User created successfully: {} with ID: {}", req.email, user_id);
+            println!("Welcome email created for user: {}", user_id);
             
             HttpResponse::Ok().json(AuthResponse {
                 message: "User created".to_string(),
@@ -615,6 +636,24 @@ async fn delete_message(
     let messages_collection = db.collection::<serde_json::Value>("messages");
     let (user_id, message_id) = path.into_inner();
 
+    // Try to delete by id field first (for string IDs like "welcome-email")
+    match messages_collection
+        .delete_one(
+            doc! { "user_id": &user_id, "id": &message_id },
+            None,
+        )
+        .await
+    {
+        Ok(result) => {
+            if result.deleted_count > 0 {
+                println!("Email {} deleted for user: {}", message_id, user_id);
+                return HttpResponse::Ok().json(json!({"message": "Message deleted"}));
+            }
+        }
+        Err(_) => {}
+    }
+
+    // If not found, try deleting by MongoDB _id (for ObjectIds)
     let msg_oid = match ObjectId::parse_str(&message_id) {
         Ok(oid) => oid,
         Err(_) => return HttpResponse::BadRequest().json(json!({"error": "Invalid message ID"})),
@@ -627,7 +666,10 @@ async fn delete_message(
         )
         .await
     {
-        Ok(_) => HttpResponse::Ok().json(json!({"message": "Message deleted"})),
+        Ok(_) => {
+            println!("Email {} deleted for user: {}", message_id, user_id);
+            HttpResponse::Ok().json(json!({"message": "Message deleted"}))
+        }
         Err(e) => {
             eprintln!("Error deleting message: {}", e);
             HttpResponse::InternalServerError()
@@ -636,7 +678,72 @@ async fn delete_message(
     }
 }
 
-// VIEWED EMAILS ENDPOINTS
+// Get all users for admin email sending
+#[get("/api/users")]
+async fn get_all_users(
+    db: web::Data<mongodb::Database>,
+) -> HttpResponse {
+    let users = db.collection::<User>("users");
+
+    match users.find(doc! {}, None).await {
+        Ok(mut cursor) => {
+            let mut user_list = Vec::new();
+            while let Ok(Some(user)) = cursor.try_next().await {
+                user_list.push(json!({
+                    "_id": user.id.map(|oid| oid.to_hex()),
+                    "firstName": user.firstName,
+                    "lastName": user.lastName,
+                    "email": user.email,
+                    "role": user.role,
+                }));
+            }
+            HttpResponse::Ok().json(user_list)
+        }
+        Err(e) => {
+            eprintln!("Error fetching users: {}", e);
+            HttpResponse::InternalServerError().json(json!({"error": "Failed to fetch users"}))
+        }
+    }
+}
+
+#[derive(Deserialize)]
+struct SendEmailRequest {
+    subject: String,
+    body: String,
+    userIds: Vec<String>,
+    from: String,
+}
+
+// Admin send email to multiple users
+#[post("/api/admin/send-email")]
+async fn send_email_to_users(
+    body: web::Json<SendEmailRequest>,
+    db: web::Data<mongodb::Database>,
+) -> HttpResponse {
+    let messages = db.collection::<serde_json::Value>("messages");
+
+    for user_id in &body.userIds {
+        let email = serde_json::json!({
+            "user_id": user_id,
+            "id": format!("admin-email-{}", Utc::now().timestamp_millis()),
+            "from": body.from,
+            "subject": body.subject,
+            "preview": &body.body.chars().take(100).collect::<String>(),
+            "body": body.body,
+            "timestamp": "just now",
+            "createdAtTimestamp": Utc::now().timestamp_millis(),
+            "unread": true,
+            "starred": false,
+            "role": "admin",
+            "isAdmin": true
+        });
+
+        let _ = messages.insert_one(email, None).await;
+    }
+
+    println!("Email sent to {} user(s)", body.userIds.len());
+    HttpResponse::Ok().json(json!({"message": "Email sent successfully"}))
+}
 
 #[get("/api/user/{user_id}/viewed-emails")]
 async fn get_viewed_emails(
@@ -771,6 +878,9 @@ async fn main() -> std::io::Result<()> {
             // Viewed emails endpoints
             .service(get_viewed_emails)
             .service(mark_email_viewed)
+            // Admin endpoints
+            .service(get_all_users)
+            .service(send_email_to_users)
     })
     .bind("0.0.0.0:8000")?
     .run()
