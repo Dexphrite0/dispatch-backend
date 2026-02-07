@@ -529,6 +529,42 @@ async fn update_profile(
 
 // MESSAGE ENDPOINTS
 
+// Mark email as read
+#[post("/api/user/{user_id}/message/{message_id}/read")]
+async fn mark_message_read(
+    path: web::Path<(String, String)>,
+    db: web::Data<mongodb::Database>,
+) -> HttpResponse {
+    let messages_collection = db.collection::<serde_json::Value>("messages");
+    let (user_id, message_id) = path.into_inner();
+
+    println!("Marking message {} as read for user {}", message_id, user_id);
+
+    match messages_collection
+        .update_one(
+            doc! { "user_id": &user_id, "id": &message_id },
+            doc! { "$set": { "unread": false } },
+            None,
+        )
+        .await
+    {
+        Ok(result) => {
+            if result.modified_count > 0 {
+                println!("✓ Message marked as read");
+                HttpResponse::Ok().json(json!({"message": "Message marked as read"}))
+            } else {
+                println!("⚠ Message not found");
+                HttpResponse::Ok().json(json!({"message": "Message not found"}))
+            }
+        }
+        Err(e) => {
+            eprintln!("✗ Error marking as read: {}", e);
+            HttpResponse::InternalServerError()
+                .json(json!({"error": "Failed to mark as read"}))
+        }
+    }
+}
+
 // GET user messages from messages collection
 #[get("/api/user/{user_id}/messages")]
 async fn get_user_messages(
@@ -930,6 +966,7 @@ async fn main() -> std::io::Result<()> {
             .service(save_background)
             .service(update_profile)
             // Message endpoints
+            .service(mark_message_read)
             .service(get_user_messages)
             .service(save_messages)
             .service(get_messages)
