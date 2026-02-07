@@ -722,27 +722,41 @@ async fn send_email_to_users(
 ) -> HttpResponse {
     let messages = db.collection::<serde_json::Value>("messages");
 
+    println!("Sending email to {} users", body.userIds.len());
+    println!("User IDs: {:?}", body.userIds);
+
     for user_id in &body.userIds {
+        let timestamp = Utc::now().timestamp_millis();
+        let email_id = format!("admin-email-{}", timestamp);
+        let preview = body.body.chars().take(100).collect::<String>();
+        
         let email = serde_json::json!({
             "user_id": user_id,
-            "id": format!("admin-email-{}", Utc::now().timestamp_millis()),
-            "from": body.from,
-            "subject": body.subject,
-            "preview": &body.body.chars().take(100).collect::<String>(),
-            "body": body.body,
+            "id": email_id,
+            "from": &body.from,
+            "subject": &body.subject,
+            "preview": preview,
+            "body": &body.body,
             "timestamp": "just now",
-            "createdAtTimestamp": Utc::now().timestamp_millis(),
+            "createdAtTimestamp": timestamp,
             "unread": true,
             "starred": false,
             "role": "admin",
             "isAdmin": true
         });
 
-        let _ = messages.insert_one(email, None).await;
+        match messages.insert_one(email.clone(), None).await {
+            Ok(result) => {
+                println!("✓ Email sent to user {}: {:?}", user_id, result.inserted_id);
+            }
+            Err(e) => {
+                eprintln!("✗ Failed to send email to user {}: {}", user_id, e);
+            }
+        }
     }
 
-    println!("Email sent to {} user(s)", body.userIds.len());
-    HttpResponse::Ok().json(json!({"message": "Email sent successfully"}))
+    println!("✓ Email broadcast completed");
+    HttpResponse::Ok().json(json!({"message": "Email sent successfully", "count": body.userIds.len()}))
 }
 
 #[get("/api/user/{user_id}/viewed-emails")]
