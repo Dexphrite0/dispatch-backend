@@ -1,10 +1,11 @@
-use actix_web::{web, App, HttpServer, HttpResponse, middleware, get, post};
+use actix_web::{web, App, HttpServer, HttpResponse, middleware, get, post, delete};
 use actix_cors::Cors;
 use mongodb::{Client, bson::{doc, oid::ObjectId}};
 use mongodb::options::ClientOptions;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use chrono::{Utc, DateTime as ChronoDateTime};
+use futures::stream::TryStreamExt;
 
 #[derive(Serialize, Deserialize, Clone)]
 struct User {
@@ -28,7 +29,26 @@ struct User {
     #[serde(skip_serializing_if = "Option::is_none")]
     bio: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    createdAt: Option<i64>, // Store as Unix timestamp
+    createdAt: Option<i64>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+struct Message {
+    #[serde(rename = "_id", skip_serializing_if = "Option::is_none")]
+    id: Option<ObjectId>,
+    user_id: String,
+    from: String,
+    subject: String,
+    preview: String,
+    body: String,
+    timestamp: String,
+    read: bool,
+    starred: bool,
+    role: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    isWelcome: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    createdAt: Option<i64>,
 }
 
 #[derive(Deserialize)]
@@ -73,6 +93,44 @@ struct ErrorResponse {
     error: String,
 }
 
+#[derive(Deserialize)]
+struct SaveMessagesRequest {
+    messages: Vec<serde_json::Value>,
+}
+
+#[derive(Deserialize)]
+struct MessageUpdateRequest {
+    read: Option<bool>,
+    starred: Option<bool>,
+}
+
+#[derive(Deserialize)]
+struct SetRoleRequest {
+    user_id: String,
+    role: String,
+}
+
+#[derive(Deserialize)]
+struct ProfilePicRequest {
+    profilePic: String,
+}
+
+#[derive(Deserialize)]
+struct BackgroundRequest {
+    backgroundImage: String,
+}
+
+#[derive(Deserialize)]
+struct ProfileUpdateRequest {
+    firstName: Option<String>,
+    lastName: Option<String>,
+    bio: Option<String>,
+    phone: Option<String>,
+    location: Option<String>,
+    website: Option<String>,
+    role: Option<String>,
+}
+
 // Helper function to format Unix timestamp to readable string
 fn format_timestamp(timestamp: i64) -> String {
     match ChronoDateTime::<Utc>::from_timestamp_millis(timestamp) {
@@ -81,7 +139,7 @@ fn format_timestamp(timestamp: i64) -> String {
     }
 }
 
-// Helper function to format timestamp as relative time (e.g., "4 hrs ago", "2 days ago")
+// Helper function to format timestamp as relative time
 fn format_timestamp_relative(timestamp: i64) -> String {
     let now = Utc::now().timestamp_millis();
     let diff_ms = now - timestamp;
@@ -110,36 +168,31 @@ fn format_timestamp_relative(timestamp: i64) -> String {
     }
 }
 
+// USER ENDPOINTS
+
 async fn signup(
     req: web::Json<SignupRequest>,
     db: web::Data<mongodb::Database>,
 ) -> HttpResponse {
     let users = db.collection::<User>("users");
     
-    // FIRST: Check if email already exists
     match users.find_one(doc! { "email": &req.email }, None).await {
         Ok(Some(_)) => {
-            // Email already exists - STOP here and return error
             return HttpResponse::BadRequest().json(ErrorResponse {
                 error: "Email already exists".to_string(),
             });
         }
         Err(e) => {
-            // Database error during check
             println!("Database error checking email: {}", e);
             return HttpResponse::InternalServerError().json(ErrorResponse {
                 error: "Database error".to_string(),
             });
         }
-        Ok(None) => {
-            // Email is unique, continue with signup
-        }
+        Ok(None) => {}
     }
     
-    // SECOND: Hash password
     let hashed = bcrypt::hash(&req.password, 4).unwrap_or_else(|_| req.password.clone());
     
-    // THIRD: Create user object with createdAt timestamp
     let now_timestamp = Utc::now().timestamp_millis();
     let user = User {
         id: None,
@@ -157,15 +210,12 @@ async fn signup(
         createdAt: Some(now_timestamp),
     };
 
-    // FOURTH: Insert user
     match users.insert_one(&user, None).await {
         Ok(result) => {
-            // Get the inserted ID and convert to string
             let user_id = result.inserted_id.as_object_id()
                 .map(|oid| oid.to_hex())
                 .unwrap_or_else(|| "unknown".to_string());
             
-            // Format the timestamp for response
             let created_at_str = format_timestamp(now_timestamp);
             let created_at_relative = format_timestamp_relative(now_timestamp);
             
@@ -203,7 +253,6 @@ async fn login(
                     .map(|oid| oid.to_hex())
                     .unwrap_or_else(|| "unknown".to_string());
                 
-                // Format the timestamp for response
                 let created_at_str = user.createdAt
                     .map(|ts| format_timestamp(ts))
                     .unwrap_or_else(|| "Unknown".to_string());
@@ -247,19 +296,12 @@ async fn login(
     }
 }
 
-#[derive(Deserialize)]
-struct SetRoleRequest {
-    user_id: String,
-    role: String,
-}
-
 async fn set_role(
     req: web::Json<SetRoleRequest>,
     db: web::Data<mongodb::Database>,
 ) -> HttpResponse {
     let users = db.collection::<User>("users");
 
-    // Convert the user_id string back to ObjectId
     let user_oid = match ObjectId::parse_str(&req.user_id) {
         Ok(oid) => oid,
         Err(e) => {
@@ -297,7 +339,6 @@ async fn set_role(
     }
 }
 
-// GET user profile data
 #[get("/api/user/{user_id}")]
 async fn get_user(
     user_id: web::Path<String>,
@@ -313,7 +354,6 @@ async fn get_user(
 
     match users.find_one(doc! { "_id": user_oid }, None).await {
         Ok(Some(user)) => {
-            // Create response with formatted createdAt
             let mut response_user = json!({
                 "_id": user.id.map(|oid| oid.to_hex()),
                 "firstName": user.firstName,
@@ -328,7 +368,6 @@ async fn get_user(
                 "bio": user.bio,
             });
             
-            // Convert createdAt timestamp to readable strings
             if let Some(created_at_ts) = user.createdAt {
                 let created_at_str = format_timestamp(created_at_ts);
                 let created_at_relative = format_timestamp_relative(created_at_ts);
@@ -344,12 +383,6 @@ async fn get_user(
             HttpResponse::InternalServerError().json(json!({"error": "Database error"}))
         }
     }
-}
-
-// POST profile pic to user
-#[derive(Deserialize)]
-struct ProfilePicRequest {
-    profilePic: String,
 }
 
 #[post("/api/user/{user_id}/profile-pic")]
@@ -382,12 +415,6 @@ async fn save_profile_pic(
     }
 }
 
-// POST background image to user
-#[derive(Deserialize)]
-struct BackgroundRequest {
-    backgroundImage: String,
-}
-
 #[post("/api/user/{user_id}/background")]
 async fn save_background(
     user_id: web::Path<String>,
@@ -416,18 +443,6 @@ async fn save_background(
             HttpResponse::InternalServerError().json(json!({"error": "Failed to save background"}))
         }
     }
-}
-
-// POST profile update (bio, phone, location, website, etc)
-#[derive(Deserialize)]
-struct ProfileUpdateRequest {
-    firstName: Option<String>,
-    lastName: Option<String>,
-    bio: Option<String>,
-    phone: Option<String>,
-    location: Option<String>,
-    website: Option<String>,
-    role: Option<String>,
 }
 
 #[post("/api/user/{user_id}/profile")]
@@ -486,6 +501,136 @@ async fn update_profile(
     }
 }
 
+// MESSAGE ENDPOINTS
+
+#[post("/api/user/{user_id}/messages")]
+async fn save_messages(
+    user_id: web::Path<String>,
+    body: web::Json<SaveMessagesRequest>,
+    db: web::Data<mongodb::Database>,
+) -> HttpResponse {
+    let messages_collection = db.collection::<serde_json::Value>("messages");
+    let user_id_str = user_id.into_inner();
+
+    // Clear existing messages for this user
+    messages_collection
+        .delete_many(doc! { "user_id": &user_id_str }, None)
+        .await
+        .ok();
+
+    // Insert new messages
+    for msg in &body.messages {
+        let mut msg_with_user = msg.clone();
+        msg_with_user["user_id"] = json!(user_id_str.clone());
+        msg_with_user["createdAt"] = json!(Utc::now().timestamp_millis());
+
+        messages_collection.insert_one(msg_with_user, None).await.ok();
+    }
+
+    HttpResponse::Ok().json(json!({"message": "Messages saved successfully"}))
+}
+
+#[get("/api/user/{user_id}/messages")]
+async fn get_messages(
+    user_id: web::Path<String>,
+    db: web::Data<mongodb::Database>,
+) -> HttpResponse {
+    let messages_collection = db.collection::<serde_json::Value>("messages");
+    let user_id_str = user_id.into_inner();
+
+    match messages_collection
+        .find(doc! { "user_id": &user_id_str }, None)
+        .await
+    {
+        Ok(mut cursor) => {
+            let mut messages = Vec::new();
+            while let Ok(Some(msg)) = cursor.try_next().await {
+                messages.push(msg);
+            }
+            HttpResponse::Ok().json(messages)
+        }
+        Err(e) => {
+            eprintln!("Error fetching messages: {}", e);
+            HttpResponse::InternalServerError()
+                .json(json!({"error": "Failed to fetch messages"}))
+        }
+    }
+}
+
+#[post("/api/user/{user_id}/message/{message_id}")]
+async fn update_message(
+    path: web::Path<(String, String)>,
+    body: web::Json<MessageUpdateRequest>,
+    db: web::Data<mongodb::Database>,
+) -> HttpResponse {
+    let messages_collection = db.collection::<serde_json::Value>("messages");
+    let (user_id, message_id) = path.into_inner();
+
+    let mut update_fields = doc! {};
+
+    if let Some(read) = body.read {
+        update_fields.insert("read", read);
+    }
+    if let Some(starred) = body.starred {
+        update_fields.insert("starred", starred);
+    }
+
+    if update_fields.is_empty() {
+        return HttpResponse::BadRequest()
+            .json(json!({"error": "No fields to update"}));
+    }
+
+    let msg_oid = match ObjectId::parse_str(&message_id) {
+        Ok(oid) => oid,
+        Err(_) => return HttpResponse::BadRequest().json(json!({"error": "Invalid message ID"})),
+    };
+
+    match messages_collection
+        .update_one(
+            doc! { "user_id": &user_id, "_id": msg_oid },
+            doc! { "$set": update_fields },
+            None,
+        )
+        .await
+    {
+        Ok(_) => HttpResponse::Ok().json(json!({"message": "Message updated"})),
+        Err(e) => {
+            eprintln!("Error updating message: {}", e);
+            HttpResponse::InternalServerError()
+                .json(json!({"error": "Failed to update message"}))
+        }
+    }
+}
+
+#[delete("/api/user/{user_id}/message/{message_id}")]
+async fn delete_message(
+    path: web::Path<(String, String)>,
+    db: web::Data<mongodb::Database>,
+) -> HttpResponse {
+    let messages_collection = db.collection::<serde_json::Value>("messages");
+    let (user_id, message_id) = path.into_inner();
+
+    let msg_oid = match ObjectId::parse_str(&message_id) {
+        Ok(oid) => oid,
+        Err(_) => return HttpResponse::BadRequest().json(json!({"error": "Invalid message ID"})),
+    };
+
+    match messages_collection
+        .delete_one(
+            doc! { "user_id": &user_id, "_id": msg_oid },
+            None,
+        )
+        .await
+    {
+        Ok(_) => HttpResponse::Ok().json(json!({"message": "Message deleted"})),
+        Err(e) => {
+            eprintln!("Error deleting message: {}", e);
+            HttpResponse::InternalServerError()
+                .json(json!({"error": "Failed to delete message"}))
+        }
+    }
+}
+
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
     dotenv::dotenv().ok();
@@ -520,7 +665,6 @@ async fn main() -> std::io::Result<()> {
     println!("Starting server on http://0.0.0.0:8000");
 
     HttpServer::new(move || {
-        // Proper CORS configuration
         let cors = Cors::default()
             .allow_any_origin()
             .allow_any_method()
@@ -539,6 +683,11 @@ async fn main() -> std::io::Result<()> {
             .service(save_profile_pic)
             .service(save_background)
             .service(update_profile)
+            // Message endpoints
+            .service(save_messages)
+            .service(get_messages)
+            .service(update_message)
+            .service(delete_message)
     })
     .bind("0.0.0.0:8000")?
     .run()
