@@ -21,6 +21,8 @@ struct User {
     #[serde(skip_serializing_if = "Option::is_none")]
     backgroundImage: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    coverImage: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     phone: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     location: Option<String>,
@@ -121,6 +123,11 @@ struct BackgroundRequest {
 }
 
 #[derive(Deserialize)]
+struct CoverImageRequest {
+    coverImage: String,
+}
+
+#[derive(Deserialize)]
 struct ProfileUpdateRequest {
     firstName: Option<String>,
     lastName: Option<String>,
@@ -208,6 +215,7 @@ async fn signup(
         role: None,
         profilePic: None,
         backgroundImage: None,
+        coverImage: None,
         phone: None,
         location: None,
         website: None,
@@ -388,6 +396,7 @@ async fn get_user(
                 "role": user.role,
                 "profilePic": user.profilePic,
                 "backgroundImage": user.backgroundImage,
+                "coverImage": user.coverImage,
                 "phone": user.phone,
                 "location": user.location,
                 "website": user.website,
@@ -467,6 +476,36 @@ async fn save_background(
         Err(e) => {
             eprintln!("Database error: {}", e);
             HttpResponse::InternalServerError().json(json!({"error": "Failed to save background"}))
+        }
+    }
+}
+
+#[post("/api/user/{user_id}/cover-image")]
+async fn save_cover_image(
+    user_id: web::Path<String>,
+    body: web::Json<CoverImageRequest>,
+    db: web::Data<mongodb::Database>,
+) -> HttpResponse {
+    let users = db.collection::<User>("users");
+    let user_id_str = user_id.into_inner();
+    
+    let user_oid = match ObjectId::parse_str(&user_id_str) {
+        Ok(oid) => oid,
+        Err(_) => return HttpResponse::BadRequest().json(json!({"error": "Invalid user ID"})),
+    };
+
+    match users.update_one(
+        doc! { "_id": user_oid },
+        doc! { "$set": { "coverImage": &body.coverImage } },
+        None,
+    ).await {
+        Ok(_) => {
+            println!("Cover image saved for user: {}", user_id_str);
+            HttpResponse::Ok().json(json!({"message": "Cover image saved"}))
+        }
+        Err(e) => {
+            eprintln!("Database error: {}", e);
+            HttpResponse::InternalServerError().json(json!({"error": "Failed to save cover image"}))
         }
     }
 }
@@ -964,6 +1003,7 @@ async fn main() -> std::io::Result<()> {
             .service(get_user)
             .service(save_profile_pic)
             .service(save_background)
+            .service(save_cover_image)
             .service(update_profile)
             // Message endpoints
             .service(mark_message_read)
