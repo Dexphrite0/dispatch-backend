@@ -1090,6 +1090,8 @@ async fn main() -> std::io::Result<()> {
         App::new()
             .app_data(db.clone())
             .app_data(connections_data.clone())
+            .app_data(web::JsonConfig::default().limit(20 * 1024 * 1024))
+            .app_data(web::PayloadConfig::default().limit(20 * 1024 * 1024))
             .wrap(cors)
             .wrap(middleware::NormalizePath::trim())
             // Auth
