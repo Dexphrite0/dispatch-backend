@@ -10,10 +10,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
-// ── SHARED STATE TYPE ────────────────────────────────────────────────────────
 type WsConnections = Arc<RwLock<HashMap<String, tokio::sync::mpsc::UnboundedSender<String>>>>;
-
-// ── STRUCTS ──────────────────────────────────────────────────────────────────
 
 #[derive(Serialize, Deserialize, Clone)]
 struct User {
@@ -40,7 +37,6 @@ struct User {
     bio: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     createdAt: Option<i64>,
-    // ── chat fields ──
     #[serde(skip_serializing_if = "Option::is_none")]
     online: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -172,6 +168,15 @@ struct SendEmailRequest {
     from: String,
 }
 
+// ── NEW: HTTP fallback for sending chat messages when WS is down ──
+#[derive(Deserialize)]
+struct SendChatMessageRequest {
+    to: String,
+    content: String,
+    sender_id: String,
+    reply_to: Option<serde_json::Value>,
+}
+
 // ── TIMESTAMP HELPERS ────────────────────────────────────────────────────────
 
 fn format_timestamp(timestamp: i64) -> String {
@@ -271,7 +276,6 @@ async fn ws_send_message(
     let msgs_coll  = db.collection::<serde_json::Value>("chat_messages");
     let timestamp  = Utc::now().timestamp_millis();
 
-    // Find existing conversation or create new one
     let conv_id = match convs_coll
         .find_one(doc! { "participants": { "$all": [sender_id, to], "$size": 2 } }, None)
         .await
@@ -295,7 +299,6 @@ async fn ws_send_message(
         }
     };
 
-    // Save message
     let msg_doc = json!({
         "conversation_id": &conv_id,
         "sender_id": sender_id,
@@ -310,17 +313,12 @@ async fn ws_send_message(
         Err(_) => return,
     };
 
-    // Update conversation: last message + increment recipient unread
     let unread_key = format!("unread.{}", to);
     if let Ok(conv_oid) = ObjectId::parse_str(&conv_id) {
         let _ = convs_coll.update_one(
             doc! { "_id": conv_oid },
             doc! {
-                "$set": {
-                    "last_message": content,
-                    "last_message_time": timestamp,
-                    "last_message_sender": sender_id,
-                },
+                "$set": { "last_message": content, "last_message_time": timestamp, "last_message_sender": sender_id },
                 "$inc": { &unread_key: 1i32 },
             },
             None,
@@ -357,7 +355,6 @@ async fn ws_forward_typing(
         "type": if is_typing { "typing" } else { "stop_typing" },
         "from": sender_id,
     })).unwrap_or_default();
-
     let guard = conns.read().await;
     if let Some(tx) = guard.get(to) { let _ = tx.send(payload); }
 }
@@ -381,11 +378,7 @@ async fn ws_read_receipt(
     ).await;
 
     let unread_key = format!("unread.{}", reader_id);
-    let _ = convs_coll.update_one(
-        doc! { "_id": &conv_oid },
-        doc! { "$set": { &unread_key: 0i32 } },
-        None,
-    ).await;
+    let _ = convs_coll.update_one(doc! { "_id": &conv_oid }, doc! { "$set": { &unread_key: 0i32 } }, None).await;
 
     if let Ok(Some(conv)) = convs_coll.find_one(doc! { "_id": &conv_oid }, None).await {
         if let Some(parts) = conv.get("participants").and_then(|v| v.as_array()) {
@@ -420,7 +413,6 @@ async fn ws_delete_message(
     let msgs_coll  = db.collection::<serde_json::Value>("chat_messages");
     let convs_coll = db.collection::<serde_json::Value>("conversations");
 
-    // Only sender can delete their own message
     let updated = msgs_coll.update_one(
         doc! { "_id": &msg_oid, "sender_id": user_id },
         doc! { "$set": { "deleted": true, "content": "This message was deleted" } },
@@ -463,7 +455,6 @@ async fn ws_chat(
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
     conns.write().await.insert(user_id.clone(), tx);
 
-    // Mark user online
     {
         let users = db.collection::<serde_json::Value>("users");
         if let Ok(oid) = ObjectId::parse_str(&user_id) {
@@ -496,7 +487,6 @@ async fn ws_chat(
             }
         }
 
-        // Cleanup on disconnect
         conns.write().await.remove(&uid);
         let now   = Utc::now().timestamp_millis();
         let users = db.collection::<serde_json::Value>("users");
@@ -514,6 +504,107 @@ async fn ws_chat(
 }
 
 // ── CHAT HTTP ENDPOINTS ──────────────────────────────────────────────────────
+
+// HTTP fallback — saves message to DB even when WebSocket is down
+// Also pushes to recipient via WS if they happen to be connected
+#[post("/api/chat/send")]
+async fn send_chat_message_http(
+    body: web::Json<SendChatMessageRequest>,
+    db: web::Data<mongodb::Database>,
+    conns: web::Data<WsConnections>,
+) -> HttpResponse {
+    let convs_coll = db.collection::<serde_json::Value>("conversations");
+    let msgs_coll  = db.collection::<serde_json::Value>("chat_messages");
+    let timestamp  = Utc::now().timestamp_millis();
+
+    if body.content.trim().is_empty() {
+        return HttpResponse::BadRequest().json(json!({"error": "Empty message"}));
+    }
+
+    // Find existing conversation or create one
+    let conv_id = match convs_coll
+        .find_one(doc! { "participants": { "$all": [&body.sender_id, &body.to], "$size": 2 } }, None)
+        .await
+    {
+        Ok(Some(conv)) => conv
+            .get("_id").and_then(|v| v.as_object())
+            .and_then(|o| o.get("$oid")).and_then(|v| v.as_str())
+            .unwrap_or_default().to_string(),
+        _ => {
+            let new_conv = json!({
+                "participants": [&body.sender_id, &body.to],
+                "last_message": &body.content,
+                "last_message_time": timestamp,
+                "last_message_sender": &body.sender_id,
+                "unread": {},
+            });
+            match convs_coll.insert_one(new_conv, None).await {
+                Ok(r) => r.inserted_id.as_object_id().map(|o| o.to_hex()).unwrap_or_default(),
+                Err(e) => {
+                    eprintln!("Failed to create conversation: {}", e);
+                    return HttpResponse::InternalServerError().json(json!({"error": "Failed to create conversation"}));
+                }
+            }
+        }
+    };
+
+    // Save message to DB
+    let msg_doc = json!({
+        "conversation_id": &conv_id,
+        "sender_id": &body.sender_id,
+        "content": &body.content,
+        "timestamp": timestamp,
+        "read": false,
+        "deleted": false,
+        "reply_to": body.reply_to,
+    });
+
+    let msg_id = match msgs_coll.insert_one(msg_doc, None).await {
+        Ok(r) => r.inserted_id.as_object_id().map(|o| o.to_hex()).unwrap_or_default(),
+        Err(e) => {
+            eprintln!("Failed to save chat message: {}", e);
+            return HttpResponse::InternalServerError().json(json!({"error": "Failed to save message"}));
+        }
+    };
+
+    // Update conversation preview + recipient unread count
+    let unread_key = format!("unread.{}", body.to);
+    if let Ok(oid) = ObjectId::parse_str(&conv_id) {
+        let _ = convs_coll.update_one(
+            doc! { "_id": oid },
+            doc! {
+                "$set": {
+                    "last_message": &body.content,
+                    "last_message_time": timestamp,
+                    "last_message_sender": &body.sender_id,
+                },
+                "$inc": { &unread_key: 1i32 },
+            },
+            None,
+        ).await;
+    }
+
+    let msg_data = json!({
+        "_id": &msg_id,
+        "conversation_id": &conv_id,
+        "sender_id": &body.sender_id,
+        "content": &body.content,
+        "timestamp": timestamp,
+        "read": false,
+        "deleted": false,
+        "reply_to": body.reply_to,
+    });
+
+    // If recipient is connected via WS, push it to them immediately
+    let ws_payload = serde_json::to_string(&json!({ "type": "message", "data": &msg_data })).unwrap_or_default();
+    let guard = conns.read().await;
+    if let Some(tx) = guard.get(&body.to) {
+        let _ = tx.send(ws_payload);
+    }
+    drop(guard);
+
+    HttpResponse::Ok().json(json!({ "message": msg_data }))
+}
 
 #[get("/api/chat/users/{user_id}")]
 async fn get_chat_users(
@@ -533,10 +624,6 @@ async fn get_chat_users(
         _ => return HttpResponse::NotFound().json(json!({"error": "User not found"})),
     };
 
-    // Role-based permission matrix:
-    // customer   → management only
-    // management → customer + admin
-    // admin      → management + customer
     let allowed: Vec<&str> = match current.role.as_deref().unwrap_or("") {
         "customer"   => vec!["management"],
         "management" => vec!["customer", "admin"],
@@ -656,7 +743,6 @@ async fn get_conversation_messages(
         Ok(mut cursor) => {
             let mut result: Vec<serde_json::Value> = Vec::new();
             while let Ok(Some(mut msg)) = cursor.try_next().await {
-                // Normalise {"$oid": "hex"} → plain string
                 if let Some(id_str) = msg.get("_id")
                     .and_then(|v| v.as_object())
                     .and_then(|o| o.get("$oid"))
@@ -679,165 +765,104 @@ async fn get_conversation_messages(
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// EXISTING ENDPOINTS (unchanged)
+// EXISTING ENDPOINTS
 // ═══════════════════════════════════════════════════════════════════════════
 
-async fn signup(
-    req: web::Json<SignupRequest>,
-    db: web::Data<mongodb::Database>,
-) -> HttpResponse {
+async fn signup(req: web::Json<SignupRequest>, db: web::Data<mongodb::Database>) -> HttpResponse {
     let users = db.collection::<User>("users");
-    
     match users.find_one(doc! { "email": &req.email }, None).await {
         Ok(Some(_)) => return HttpResponse::BadRequest().json(ErrorResponse { error: "Email already exists".to_string() }),
-        Err(e) => { println!("Database error checking email: {}", e); return HttpResponse::InternalServerError().json(ErrorResponse { error: "Database error".to_string() }); }
+        Err(e) => { println!("DB error: {}", e); return HttpResponse::InternalServerError().json(ErrorResponse { error: "Database error".to_string() }); }
         Ok(None) => {}
     }
-    
     let hashed = bcrypt::hash(&req.password, 4).unwrap_or_else(|_| req.password.clone());
     let now_timestamp = Utc::now().timestamp_millis();
-    
     let user = User {
-        id: None,
-        firstName: req.firstName.clone(),
-        lastName: req.lastName.clone(),
-        email: req.email.clone(),
-        password: hashed,
-        role: None,
-        profilePic: None,
-        backgroundImage: None,
-        coverImage: None,
-        phone: None,
-        location: None,
-        website: None,
-        bio: None,
-        createdAt: Some(now_timestamp),
-        online: None,
-        last_seen: None,
+        id: None, firstName: req.firstName.clone(), lastName: req.lastName.clone(),
+        email: req.email.clone(), password: hashed, role: None,
+        profilePic: None, backgroundImage: None, coverImage: None,
+        phone: None, location: None, website: None, bio: None,
+        createdAt: Some(now_timestamp), online: None, last_seen: None,
     };
-
     match users.insert_one(&user, None).await {
         Ok(result) => {
-            let user_id = result.inserted_id.as_object_id()
-                .map(|oid| oid.to_hex())
-                .unwrap_or_else(|| "unknown".to_string());
-            
+            let user_id = result.inserted_id.as_object_id().map(|oid| oid.to_hex()).unwrap_or_else(|| "unknown".to_string());
             let welcome_email = json!({
-                "user_id": &user_id,
-                "id": "welcome-email",
-                "from": "Dispatch Team",
+                "user_id": &user_id, "id": "welcome-email", "from": "Dispatch Team",
                 "subject": "Welcome to Dispatch! 🎉",
                 "preview": "Get started with your incident reporting dashboard",
-                "body": "Welcome to Dispatch! 🎉\nThank you for creating your account. We're excited to have you on board!\nHere's what you can do with Dispatch:\n• Create and track incident reports\n• Receive real-time status updates\n• Collaborate with admin and management teams\n• Access comprehensive analytics and insights\n\nGetting Started:\n1. Complete your profile - Add your details to help us serve you better\n2. Create your first report - Start documenting incidents immediately\n3. Explore integrations - Connect with Email, SMS, and Google Calendar\n\nNeed Help?\nOur support team is here to assist you. Check out our documentation or reach out to support@dispatch.com\n\nBest regards,\nThe Dispatch Team",
-                "timestamp": "just now",
-                "createdAtTimestamp": now_timestamp,
-                "unread": true,
-                "starred": false,
-                "role": "admin",
-                "isWelcome": true
+                "body": "Welcome to Dispatch! 🎉\nThank you for creating your account.\n\nBest regards,\nThe Dispatch Team",
+                "timestamp": "just now", "createdAtTimestamp": now_timestamp,
+                "unread": true, "starred": false, "role": "admin", "isWelcome": true
             });
-            
             let messages = db.collection::<serde_json::Value>("messages");
             let _ = messages.insert_one(welcome_email, None).await;
-            
             println!("User created: {} — ID: {}", req.email, user_id);
-            
             HttpResponse::Ok().json(AuthResponse {
-                message: "User created".to_string(),
-                user_id,
-                firstName: req.firstName.clone(),
-                lastName: req.lastName.clone(),
-                email: req.email.clone(),
-                createdAt: format_timestamp(now_timestamp),
-                createdAtRelative: format_timestamp_relative(now_timestamp),
+                message: "User created".to_string(), user_id,
+                firstName: req.firstName.clone(), lastName: req.lastName.clone(), email: req.email.clone(),
+                createdAt: format_timestamp(now_timestamp), createdAtRelative: format_timestamp_relative(now_timestamp),
             })
         }
-        Err(e) => {
-            println!("Error inserting user: {}", e);
-            HttpResponse::BadRequest().json(ErrorResponse { error: "Failed to create user".to_string() })
-        }
+        Err(e) => { println!("Error inserting user: {}", e); HttpResponse::BadRequest().json(ErrorResponse { error: "Failed to create user".to_string() }) }
     }
 }
 
-async fn login(
-    req: web::Json<LoginRequest>,
-    db: web::Data<mongodb::Database>,
-) -> HttpResponse {
+async fn login(req: web::Json<LoginRequest>, db: web::Data<mongodb::Database>) -> HttpResponse {
     let users = db.collection::<User>("users");
-
     match users.find_one(doc! { "email": &req.email }, None).await {
         Ok(Some(user)) => {
             if bcrypt::verify(&req.password, &user.password).unwrap_or(false) {
                 let user_id = user.id.map(|oid| oid.to_hex()).unwrap_or_else(|| "unknown".to_string());
-                println!("Login successful for: {} — role: {:?}", req.email, user.role);
                 HttpResponse::Ok().json(LoginResponse {
-                    message: "Login successful".to_string(),
-                    user_id,
-                    firstName: user.firstName,
-                    lastName: user.lastName,
-                    email: user.email,
-                    role: user.role,
+                    message: "Login successful".to_string(), user_id,
+                    firstName: user.firstName, lastName: user.lastName, email: user.email, role: user.role,
                     createdAt: user.createdAt.map(format_timestamp).unwrap_or_else(|| "Unknown".to_string()),
                     createdAtRelative: user.createdAt.map(format_timestamp_relative).unwrap_or_else(|| "Unknown".to_string()),
                 })
             } else {
-                println!("Invalid password for: {}", req.email);
                 HttpResponse::Unauthorized().json(ErrorResponse { error: "Invalid password".to_string() })
             }
         }
         Ok(None) => HttpResponse::Unauthorized().json(ErrorResponse { error: "User not found".to_string() }),
-        Err(e) => { println!("DB error during login: {}", e); HttpResponse::InternalServerError().json(ErrorResponse { error: "Database error".to_string() }) }
+        Err(e) => { println!("DB error: {}", e); HttpResponse::InternalServerError().json(ErrorResponse { error: "Database error".to_string() }) }
     }
 }
 
-async fn set_role(
-    req: web::Json<SetRoleRequest>,
-    db: web::Data<mongodb::Database>,
-) -> HttpResponse {
+async fn set_role(req: web::Json<SetRoleRequest>, db: web::Data<mongodb::Database>) -> HttpResponse {
     let users = db.collection::<User>("users");
     let user_oid = match ObjectId::parse_str(&req.user_id) {
         Ok(oid) => oid,
         Err(e) => { println!("Invalid user_id: {} - {}", req.user_id, e); return HttpResponse::BadRequest().json(ErrorResponse { error: "Invalid user ID format".to_string() }); }
     };
-
     match users.update_one(doc! { "_id": user_oid }, doc! { "$set": { "role": &req.role } }, None).await {
         Ok(result) => {
-            if result.modified_count > 0 {
-                println!("Role set: {} → {}", req.user_id, req.role);
-                HttpResponse::Ok().json(json!({ "message": format!("Role set to {}", req.role) }))
-            } else {
-                HttpResponse::BadRequest().json(ErrorResponse { error: "User not found".to_string() })
-            }
+            if result.modified_count > 0 { HttpResponse::Ok().json(json!({ "message": format!("Role set to {}", req.role) })) }
+            else { HttpResponse::BadRequest().json(ErrorResponse { error: "User not found".to_string() }) }
         }
-        Err(e) => { println!("Error setting role: {}", e); HttpResponse::BadRequest().json(ErrorResponse { error: "Failed to set role".to_string() }) }
+        Err(e) => { println!("Error: {}", e); HttpResponse::BadRequest().json(ErrorResponse { error: "Failed to set role".to_string() }) }
     }
 }
 
 #[get("/api/user/{user_id}")]
 async fn get_user(user_id: web::Path<String>, db: web::Data<mongodb::Database>) -> HttpResponse {
     let users = db.collection::<User>("users");
-    let user_id_str = user_id.into_inner();
-    let user_oid = match ObjectId::parse_str(&user_id_str) {
-        Ok(oid) => oid,
-        Err(_) => return HttpResponse::BadRequest().json(json!({"error": "Invalid user ID"})),
-    };
-
-    match users.find_one(doc! { "_id": user_oid }, None).await {
+    let uid = user_id.into_inner();
+    let oid = match ObjectId::parse_str(&uid) { Ok(o) => o, Err(_) => return HttpResponse::BadRequest().json(json!({"error": "Invalid user ID"})) };
+    match users.find_one(doc! { "_id": oid }, None).await {
         Ok(Some(user)) => {
-            let mut response_user = json!({
-                "_id": user.id.map(|oid| oid.to_hex()),
-                "firstName": user.firstName, "lastName": user.lastName,
-                "email": user.email, "role": user.role,
-                "profilePic": user.profilePic, "backgroundImage": user.backgroundImage,
-                "coverImage": user.coverImage, "phone": user.phone,
-                "location": user.location, "website": user.website, "bio": user.bio,
+            let mut r = json!({
+                "_id": user.id.map(|o| o.to_hex()), "firstName": user.firstName, "lastName": user.lastName,
+                "email": user.email, "role": user.role, "profilePic": user.profilePic,
+                "backgroundImage": user.backgroundImage, "coverImage": user.coverImage,
+                "phone": user.phone, "location": user.location, "website": user.website, "bio": user.bio,
                 "online": user.online.unwrap_or(false), "last_seen": user.last_seen,
             });
             if let Some(ts) = user.createdAt {
-                response_user["createdAt"]         = json!(format_timestamp(ts));
-                response_user["createdAtRelative"] = json!(format_timestamp_relative(ts));
+                r["createdAt"]         = json!(format_timestamp(ts));
+                r["createdAtRelative"] = json!(format_timestamp_relative(ts));
             }
-            HttpResponse::Ok().json(response_user)
+            HttpResponse::Ok().json(r)
         }
         Ok(None) => HttpResponse::NotFound().json(json!({"error": "User not found"})),
         Err(e)   => { eprintln!("DB error: {}", e); HttpResponse::InternalServerError().json(json!({"error": "Database error"})) }
@@ -847,10 +872,9 @@ async fn get_user(user_id: web::Path<String>, db: web::Data<mongodb::Database>) 
 #[post("/api/user/{user_id}/profile-pic")]
 async fn save_profile_pic(user_id: web::Path<String>, body: web::Json<ProfilePicRequest>, db: web::Data<mongodb::Database>) -> HttpResponse {
     let users = db.collection::<User>("users");
-    let uid   = user_id.into_inner();
-    let oid   = match ObjectId::parse_str(&uid) { Ok(o) => o, Err(_) => return HttpResponse::BadRequest().json(json!({"error": "Invalid user ID"})) };
+    let oid = match ObjectId::parse_str(&user_id.into_inner()) { Ok(o) => o, Err(_) => return HttpResponse::BadRequest().json(json!({"error": "Invalid user ID"})) };
     match users.update_one(doc! { "_id": oid }, doc! { "$set": { "profilePic": &body.profilePic } }, None).await {
-        Ok(_)  => HttpResponse::Ok().json(json!({"message": "Profile pic saved"})),
+        Ok(_) => HttpResponse::Ok().json(json!({"message": "Profile pic saved"})),
         Err(e) => { eprintln!("DB error: {}", e); HttpResponse::InternalServerError().json(json!({"error": "Failed to save profile pic"})) }
     }
 }
@@ -858,10 +882,9 @@ async fn save_profile_pic(user_id: web::Path<String>, body: web::Json<ProfilePic
 #[post("/api/user/{user_id}/background")]
 async fn save_background(user_id: web::Path<String>, body: web::Json<BackgroundRequest>, db: web::Data<mongodb::Database>) -> HttpResponse {
     let users = db.collection::<User>("users");
-    let uid   = user_id.into_inner();
-    let oid   = match ObjectId::parse_str(&uid) { Ok(o) => o, Err(_) => return HttpResponse::BadRequest().json(json!({"error": "Invalid user ID"})) };
+    let oid = match ObjectId::parse_str(&user_id.into_inner()) { Ok(o) => o, Err(_) => return HttpResponse::BadRequest().json(json!({"error": "Invalid user ID"})) };
     match users.update_one(doc! { "_id": oid }, doc! { "$set": { "backgroundImage": &body.backgroundImage } }, None).await {
-        Ok(_)  => HttpResponse::Ok().json(json!({"message": "Background image saved"})),
+        Ok(_) => HttpResponse::Ok().json(json!({"message": "Background image saved"})),
         Err(e) => { eprintln!("DB error: {}", e); HttpResponse::InternalServerError().json(json!({"error": "Failed to save background"})) }
     }
 }
@@ -869,10 +892,9 @@ async fn save_background(user_id: web::Path<String>, body: web::Json<BackgroundR
 #[post("/api/user/{user_id}/cover-image")]
 async fn save_cover_image(user_id: web::Path<String>, body: web::Json<CoverImageRequest>, db: web::Data<mongodb::Database>) -> HttpResponse {
     let users = db.collection::<User>("users");
-    let uid   = user_id.into_inner();
-    let oid   = match ObjectId::parse_str(&uid) { Ok(o) => o, Err(_) => return HttpResponse::BadRequest().json(json!({"error": "Invalid user ID"})) };
+    let oid = match ObjectId::parse_str(&user_id.into_inner()) { Ok(o) => o, Err(_) => return HttpResponse::BadRequest().json(json!({"error": "Invalid user ID"})) };
     match users.update_one(doc! { "_id": oid }, doc! { "$set": { "coverImage": &body.coverImage } }, None).await {
-        Ok(_)  => HttpResponse::Ok().json(json!({"message": "Cover image saved"})),
+        Ok(_) => HttpResponse::Ok().json(json!({"message": "Cover image saved"})),
         Err(e) => { eprintln!("DB error: {}", e); HttpResponse::InternalServerError().json(json!({"error": "Failed to save cover image"})) }
     }
 }
@@ -880,86 +902,85 @@ async fn save_cover_image(user_id: web::Path<String>, body: web::Json<CoverImage
 #[post("/api/user/{user_id}/profile")]
 async fn update_profile(user_id: web::Path<String>, body: web::Json<ProfileUpdateRequest>, db: web::Data<mongodb::Database>) -> HttpResponse {
     let users = db.collection::<User>("users");
-    let uid   = user_id.into_inner();
-    let oid   = match ObjectId::parse_str(&uid) { Ok(o) => o, Err(_) => return HttpResponse::BadRequest().json(json!({"error": "Invalid user ID"})) };
+    let oid = match ObjectId::parse_str(&user_id.into_inner()) { Ok(o) => o, Err(_) => return HttpResponse::BadRequest().json(json!({"error": "Invalid user ID"})) };
     let mut fields = doc! {};
-    if let Some(ref v) = body.firstName  { fields.insert("firstName",  v); }
-    if let Some(ref v) = body.lastName   { fields.insert("lastName",   v); }
-    if let Some(ref v) = body.bio        { fields.insert("bio",        v); }
-    if let Some(ref v) = body.phone      { fields.insert("phone",      v); }
-    if let Some(ref v) = body.location   { fields.insert("location",   v); }
-    if let Some(ref v) = body.website    { fields.insert("website",    v); }
-    if let Some(ref v) = body.role       { fields.insert("role",       v); }
+    if let Some(ref v) = body.firstName { fields.insert("firstName", v); }
+    if let Some(ref v) = body.lastName  { fields.insert("lastName",  v); }
+    if let Some(ref v) = body.bio       { fields.insert("bio",       v); }
+    if let Some(ref v) = body.phone     { fields.insert("phone",     v); }
+    if let Some(ref v) = body.location  { fields.insert("location",  v); }
+    if let Some(ref v) = body.website   { fields.insert("website",   v); }
+    if let Some(ref v) = body.role      { fields.insert("role",      v); }
     match users.update_one(doc! { "_id": oid }, doc! { "$set": fields }, None).await {
-        Ok(_)  => HttpResponse::Ok().json(json!({"message": "Profile updated"})),
+        Ok(_) => HttpResponse::Ok().json(json!({"message": "Profile updated"})),
         Err(e) => { eprintln!("DB error: {}", e); HttpResponse::InternalServerError().json(json!({"error": "Failed to update profile"})) }
     }
 }
 
 #[post("/api/user/{user_id}/message/{message_id}/read")]
 async fn mark_message_read(path: web::Path<(String, String)>, db: web::Data<mongodb::Database>) -> HttpResponse {
-    let messages_collection = db.collection::<serde_json::Value>("messages");
-    let (user_id, message_id) = path.into_inner();
-    match messages_collection.update_one(doc! { "user_id": &user_id, "id": &message_id }, doc! { "$set": { "unread": false } }, None).await {
-        Ok(r)  => { if r.modified_count > 0 { HttpResponse::Ok().json(json!({"message": "Message marked as read"})) } else { HttpResponse::Ok().json(json!({"message": "Message not found"})) } }
-        Err(e) => { eprintln!("Error: {}", e); HttpResponse::InternalServerError().json(json!({"error": "Failed to mark as read"})) }
+    let col = db.collection::<serde_json::Value>("messages");
+    let (uid, mid) = path.into_inner();
+    match col.update_one(doc! { "user_id": &uid, "id": &mid }, doc! { "$set": { "unread": false } }, None).await {
+        Ok(r) => { if r.modified_count > 0 { HttpResponse::Ok().json(json!({"message": "Marked as read"})) } else { HttpResponse::Ok().json(json!({"message": "Not found"})) } }
+        Err(e) => { eprintln!("Error: {}", e); HttpResponse::InternalServerError().json(json!({"error": "Failed"})) }
     }
 }
 
 #[get("/api/user/{user_id}/messages")]
 async fn get_user_messages(user_id: web::Path<String>, db: web::Data<mongodb::Database>) -> HttpResponse {
-    let messages_collection = db.collection::<serde_json::Value>("messages");
+    let col = db.collection::<serde_json::Value>("messages");
     let uid = user_id.into_inner();
-    match messages_collection.find(doc! { "user_id": &uid }, None).await {
+    match col.find(doc! { "user_id": &uid }, None).await {
         Ok(mut cursor) => {
-            let mut messages = Vec::new();
-            while let Ok(Some(msg)) = cursor.try_next().await { messages.push(msg); }
-            HttpResponse::Ok().json(messages)
+            let mut msgs = Vec::new();
+            while let Ok(Some(m)) = cursor.try_next().await { msgs.push(m); }
+            HttpResponse::Ok().json(msgs)
         }
-        Err(e) => { eprintln!("Error fetching messages: {}", e); HttpResponse::InternalServerError().json(json!({"error": "Failed to fetch messages"})) }
+        Err(e) => { eprintln!("Error: {}", e); HttpResponse::InternalServerError().json(json!({"error": "Failed to fetch messages"})) }
     }
 }
 
 #[post("/api/user/{user_id}/messages")]
 async fn save_messages(user_id: web::Path<String>, body: web::Json<SaveMessagesRequest>, db: web::Data<mongodb::Database>) -> HttpResponse {
-    let messages_collection = db.collection::<serde_json::Value>("messages");
+    let col = db.collection::<serde_json::Value>("messages");
     let uid = user_id.into_inner();
-    messages_collection.delete_many(doc! { "user_id": &uid }, None).await.ok();
+    col.delete_many(doc! { "user_id": &uid }, None).await.ok();
     for msg in &body.messages {
         let mut m = msg.clone();
-        m["user_id"]   = json!(uid.clone());
+        m["user_id"] = json!(uid.clone());
         m["createdAt"] = json!(Utc::now().timestamp_millis());
-        messages_collection.insert_one(m, None).await.ok();
+        col.insert_one(m, None).await.ok();
     }
     HttpResponse::Ok().json(json!({"message": "Messages saved successfully"}))
 }
 
 #[post("/api/user/{user_id}/message/{message_id}")]
 async fn update_message(path: web::Path<(String, String)>, body: web::Json<MessageUpdateRequest>, db: web::Data<mongodb::Database>) -> HttpResponse {
-    let messages_collection = db.collection::<serde_json::Value>("messages");
-    let (user_id, message_id) = path.into_inner();
+    let col = db.collection::<serde_json::Value>("messages");
+    let (uid, mid) = path.into_inner();
     let mut fields = doc! {};
     if let Some(read)    = body.read    { fields.insert("read",    read); }
     if let Some(starred) = body.starred { fields.insert("starred", starred); }
     if fields.is_empty() { return HttpResponse::BadRequest().json(json!({"error": "No fields to update"})); }
-    let msg_oid = match ObjectId::parse_str(&message_id) { Ok(o) => o, Err(_) => return HttpResponse::BadRequest().json(json!({"error": "Invalid message ID"})) };
-    match messages_collection.update_one(doc! { "user_id": &user_id, "_id": msg_oid }, doc! { "$set": fields }, None).await {
-        Ok(_)  => HttpResponse::Ok().json(json!({"message": "Message updated"})),
-        Err(e) => { eprintln!("Error: {}", e); HttpResponse::InternalServerError().json(json!({"error": "Failed to update message"})) }
+    let oid = match ObjectId::parse_str(&mid) { Ok(o) => o, Err(_) => return HttpResponse::BadRequest().json(json!({"error": "Invalid message ID"})) };
+    match col.update_one(doc! { "user_id": &uid, "_id": oid }, doc! { "$set": fields }, None).await {
+        Ok(_) => HttpResponse::Ok().json(json!({"message": "Updated"})),
+        Err(e) => { eprintln!("Error: {}", e); HttpResponse::InternalServerError().json(json!({"error": "Failed"})) }
     }
 }
 
 #[delete("/api/user/{user_id}/message/{message_id}")]
 async fn delete_message(path: web::Path<(String, String)>, db: web::Data<mongodb::Database>) -> HttpResponse {
-    let messages_collection = db.collection::<serde_json::Value>("messages");
-    let (user_id, message_id) = path.into_inner();
-    if let Ok(r) = messages_collection.delete_one(doc! { "user_id": &user_id, "id": &message_id }, None).await {
-        if r.deleted_count > 0 { return HttpResponse::Ok().json(json!({"message": "Message deleted"})); }
+    let col = db.collection::<serde_json::Value>("messages");
+    let (uid, mid) = path.into_inner();
+    if let Ok(r) = col.delete_one(doc! { "user_id": &uid, "id": &mid }, None).await {
+        if r.deleted_count > 0 { return HttpResponse::Ok().json(json!({"message": "Deleted"})); }
     }
-    let msg_oid = match ObjectId::parse_str(&message_id) { Ok(o) => o, Err(_) => return HttpResponse::BadRequest().json(json!({"error": "Invalid message ID"})) };
-    match messages_collection.delete_one(doc! { "user_id": &user_id, "_id": msg_oid }, None).await {
-        Ok(_)  => HttpResponse::Ok().json(json!({"message": "Message deleted"})),
-        Err(e) => { eprintln!("Error: {}", e); HttpResponse::InternalServerError().json(json!({"error": "Failed to delete message"})) }
+    let oid = match ObjectId::parse_str(&mid) { Ok(o) => o, Err(_) => return HttpResponse::BadRequest().json(json!({"error": "Invalid message ID"})) };
+    match col.delete_one(doc! { "user_id": &uid, "_id": oid }, None).await {
+        Ok(_) => HttpResponse::Ok().json(json!({"message": "Deleted"})),
+        Err(e) => { eprintln!("Error: {}", e); HttpResponse::InternalServerError().json(json!({"error": "Failed"})) }
     }
 }
 
@@ -980,31 +1001,27 @@ async fn get_all_users(db: web::Data<mongodb::Database>) -> HttpResponse {
 
 #[post("/api/admin/send-email")]
 async fn send_email_to_users(body: web::Json<SendEmailRequest>, db: web::Data<mongodb::Database>) -> HttpResponse {
-    let messages_collection = db.collection::<serde_json::Value>("messages");
-    let mut sent_count = 0;
-    for user_id in &body.userIds {
-        let timestamp = Utc::now().timestamp_millis();
+    let col = db.collection::<serde_json::Value>("messages");
+    let mut sent = 0;
+    for uid in &body.userIds {
+        let ts = Utc::now().timestamp_millis();
         let email = json!({
-            "user_id": user_id,
-            "id": format!("admin-email-{}", timestamp),
-            "from": &body.from,
-            "subject": &body.subject,
+            "user_id": uid, "id": format!("admin-email-{}", ts),
+            "from": &body.from, "subject": &body.subject,
             "preview": body.body.chars().take(100).collect::<String>(),
-            "body": &body.body,
-            "timestamp": "just now",
-            "createdAtTimestamp": timestamp,
+            "body": &body.body, "timestamp": "just now", "createdAtTimestamp": ts,
             "unread": true, "starred": false, "role": "admin", "isAdmin": true
         });
-        if messages_collection.insert_one(email, None).await.is_ok() { sent_count += 1; }
+        if col.insert_one(email, None).await.is_ok() { sent += 1; }
     }
-    HttpResponse::Ok().json(json!({ "message": "Email sent successfully", "count": sent_count, "requested": body.userIds.len() }))
+    HttpResponse::Ok().json(json!({ "message": "Email sent", "count": sent, "requested": body.userIds.len() }))
 }
 
 #[get("/api/user/{user_id}/viewed-emails")]
 async fn get_viewed_emails(user_id: web::Path<String>, db: web::Data<mongodb::Database>) -> HttpResponse {
-    let viewed = db.collection::<serde_json::Value>("viewed_emails");
-    let uid    = user_id.into_inner();
-    match viewed.find_one(doc! { "user_id": &uid }, None).await {
+    let col = db.collection::<serde_json::Value>("viewed_emails");
+    let uid = user_id.into_inner();
+    match col.find_one(doc! { "user_id": &uid }, None).await {
         Ok(Some(doc)) => {
             let ids: Vec<String> = doc.get("emailIds").and_then(|v| v.as_array())
                 .map(|arr| arr.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect())
@@ -1012,22 +1029,22 @@ async fn get_viewed_emails(user_id: web::Path<String>, db: web::Data<mongodb::Da
             HttpResponse::Ok().json(json!({"viewedEmails": ids}))
         }
         Ok(None) => HttpResponse::Ok().json(json!({"viewedEmails": []})),
-        Err(e)   => { eprintln!("Error: {}", e); HttpResponse::InternalServerError().json(json!({"error": "Failed to fetch viewed emails"})) }
+        Err(e) => { eprintln!("Error: {}", e); HttpResponse::InternalServerError().json(json!({"error": "Failed"})) }
     }
 }
 
 #[post("/api/user/{user_id}/viewed-emails")]
 async fn mark_email_viewed(user_id: web::Path<String>, body: web::Json<ViewedEmailRequest>, db: web::Data<mongodb::Database>) -> HttpResponse {
-    let viewed = db.collection::<serde_json::Value>("viewed_emails");
-    let uid    = user_id.into_inner();
-    match viewed.update_one(doc! { "user_id": &uid }, doc! { "$addToSet": { "emailIds": &body.emailId } }, None).await {
+    let col = db.collection::<serde_json::Value>("viewed_emails");
+    let uid = user_id.into_inner();
+    match col.update_one(doc! { "user_id": &uid }, doc! { "$addToSet": { "emailIds": &body.emailId } }, None).await {
         Ok(r) => {
             if r.modified_count == 0 {
-                let _ = viewed.insert_one(json!({ "user_id": &uid, "emailIds": vec![&body.emailId] }), None).await;
+                let _ = col.insert_one(json!({ "user_id": &uid, "emailIds": vec![&body.emailId] }), None).await;
             }
-            HttpResponse::Ok().json(json!({"message": "Email marked as viewed"}))
+            HttpResponse::Ok().json(json!({"message": "Marked as viewed"}))
         }
-        Err(e) => { eprintln!("Error: {}", e); HttpResponse::InternalServerError().json(json!({"error": "Failed to mark email as viewed"})) }
+        Err(e) => { eprintln!("Error: {}", e); HttpResponse::InternalServerError().json(json!({"error": "Failed"})) }
     }
 }
 
@@ -1038,13 +1055,12 @@ async fn mark_email_viewed(user_id: web::Path<String>, body: web::Json<ViewedEma
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
     dotenv::dotenv().ok();
-    
+
     let mongo_url = std::env::var("MONGO_URL").expect("MONGO_URL not set");
     let client_options = ClientOptions::parse(&mongo_url).await.expect("Failed to parse MongoDB URL");
     let client = Client::with_options(client_options).expect("Failed to create MongoDB client");
     let db     = client.database("my_app");
 
-    // Ensure email unique index
     let users = db.collection::<User>("users");
     match users.create_index(
         mongodb::IndexModel::builder()
@@ -1057,9 +1073,7 @@ async fn main() -> std::io::Result<()> {
         Err(e) => println!("⚠ Could not create index: {}", e),
     }
 
-    let db   = web::Data::new(db);
-
-    // ── Shared WebSocket connection map ──
+    let db              = web::Data::new(db);
     let connections: WsConnections = Arc::new(RwLock::new(HashMap::new()));
     let connections_data = web::Data::new(connections);
 
@@ -1088,7 +1102,7 @@ async fn main() -> std::io::Result<()> {
             .service(save_background)
             .service(save_cover_image)
             .service(update_profile)
-            // Inbox messages
+            // Inbox
             .service(mark_message_read)
             .service(get_user_messages)
             .service(save_messages)
@@ -1100,8 +1114,9 @@ async fn main() -> std::io::Result<()> {
             // Admin
             .service(get_all_users)
             .service(send_email_to_users)
-            // ── Chat ──
+            // Chat
             .service(ws_chat)
+            .service(send_chat_message_http)   // ← HTTP fallback for when WS is down
             .service(get_chat_users)
             .service(get_user_conversations)
             .service(get_conversation_messages)
