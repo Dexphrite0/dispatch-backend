@@ -1077,8 +1077,7 @@ async fn main() -> std::io::Result<()> {
     let connections: WsConnections = Arc::new(RwLock::new(HashMap::new()));
     let connections_data = web::Data::new(connections);
 
-    let port = std::env::var("PORT").unwrap_or_else(|_| "8000".to_string());
-    println!("🚀 Server starting on http://0.0.0.0:{}", port);
+    println!("🚀 Server starting on http://0.0.0.0:8000");
 
     HttpServer::new(move || {
         let cors = Cors::default()
@@ -1124,7 +1123,7 @@ async fn main() -> std::io::Result<()> {
             .service(get_user_conversations)
             .service(get_conversation_messages)
     })
-    .bind(format!("0.0.0.0:{}", port))?
+    .bind("0.0.0.0:8000")?
     .run()
     .await
 }
